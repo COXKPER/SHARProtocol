@@ -78,10 +78,11 @@ layouts and accessors, or small macros, inline functions and templates
 
   4. Combined Works.
 
-  You may convey a Combined Work under terms of your choice that, taken
-together, effectively do not restrict modification of the portions of
-the Library contained in the Combined Work and reverse engineering for
-debugging such modifications, if you also do each of the following:
+  You may convey a Combined Work under terms of your choice that,
+taken together, effectively do not restrict modification of the
+portions of the Library contained in the Combined Work and reverse
+engineering for debugging such modifications, if you also do each of
+the following:
 
    a) Give prominent notice with each copy of the Combined Work that
    the Library is used in it and that the Library and its use are
@@ -120,8 +121,9 @@ debugging such modifications, if you also do each of the following:
    Application with a modified version of the Linked Version. (If
    you use option 4d0, the Installation Information must accompany
    the Minimal Corresponding Source and Corresponding Application
-   Code. If you use option 4d1, you must follow section 6 of the
-   GNU GPL in providing Installation Information.)
+   Code. If you use option 4d1, you must provide the Installation
+   Information in the manner specified by section 6 of the GNU GPL
+   for conveying Corresponding Source.)
 
   5. Combined Libraries.
 
