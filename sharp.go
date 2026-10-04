@@ -1,14 +1,8 @@
 package twoblade
 
 import (
-	"crypto/rand"
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/big"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,12 +10,11 @@ import (
 )
 
 const (
-	ProtocolVersion = "SHARP/1.3"
 	DefaultSharpPort = 5000
 	DefaultHTTPPort  = 5001
 	MaxUsernameLen   = 20
-	MaxMessageSize   = 1024 * 1024       // 1MB
-	MaxBufferSize    = 10 * 1024 * 1024  // 10MB
+	MaxMessageSize   = 1024 * 1024      // 1MB
+	MaxBufferSize    = 10 * 1024 * 1024 // 10MB
 )
 
 var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-!$%&'*/?=^@.]+$`)
@@ -70,7 +63,13 @@ func ParseAddress(raw string) (Address, error) {
 	return Address{Username: username, Domain: domainPart, Port: port}, nil
 }
 
-// Command represents messages exchanged over TCP
+// Command represents messages exchanged over TCP.
+//
+// The fields below Hashcash are all 1.4 additions and all omitempty. A 1.4
+// sender therefore emits byte-identical JSON to a 1.3 sender when it has
+// nothing new to say, and a 1.3 receiver simply ignores the extra keys it does
+// not know (encoding/json drops unknown fields). That is what keeps 1.4 from
+// being a breaking change.
 type Command struct {
 	Type        string   `json:"type"`
 	ServerID    string   `json:"server_id,omitempty"`
@@ -84,9 +83,26 @@ type Command struct {
 	Attachments []string `json:"attachments,omitempty"`
 	Message     string   `json:"message,omitempty"`
 	Code        int      `json:"code,omitempty"`
+
+	// Supported lists every protocol version the peer can speak, newest first.
+	// A 1.4 peer sends it; a 1.3 peer sends nothing and is understood anyway.
+	Supported []string `json:"supported,omitempty"`
+	// Capabilities lists the optional extensions the peer understands.
+	Capabilities []string `json:"capabilities,omitempty"`
+	// MessageID is a sender-assigned id, so a retried delivery can be
+	// recognised as the same mail rather than filed twice.
+	MessageID string `json:"message_id,omitempty"`
+	// PublicKey is the sender's base64 Ed25519 key, and Signature the detached
+	// signature over the message content.
+	PublicKey string `json:"public_key,omitempty"`
+	Signature string `json:"signature,omitempty"`
 }
 
-// Email represents email payload
+// Email represents email payload.
+//
+// MessageID, PublicKey, Signature and ReceivedVersion are 1.4 additions. On
+// the wire they only appear when a sender actually sets them, so a plain 1.3
+// message serialises exactly as it always did.
 type Email struct {
 	From        string   `json:"from"`
 	To          string   `json:"to"`
@@ -96,9 +112,44 @@ type Email struct {
 	HTMLBody    *string  `json:"html_body,omitempty"`
 	Attachments []string `json:"attachments,omitempty"`
 	Hashcash    string   `json:"hashcash,omitempty"`
+
+	// MessageID is set by the sender; a receiver may use it to discard a
+	// duplicate delivery caused by a retry.
+	MessageID string `json:"message_id,omitempty"`
+	// PublicKey and Signature carry the sender's detached signature.
+	PublicKey string `json:"public_key,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	// ReceivedVersion records the protocol version this message arrived under,
+	// so a handler can tell a signed 1.4 peer from an unsigned 1.3 one.
+	ReceivedVersion string `json:"received_version,omitempty"`
 }
 
-// Hashcash verification and generation
+// Version reports the protocol version this message arrived under, or
+// "unknown" for a message built locally rather than received over the wire.
+func (e Email) Version() string {
+	if e.ReceivedVersion == "" {
+		return "unknown"
+	}
+	return e.ReceivedVersion
+}
+
+// Signed reports whether the message carries signature material. It says
+// nothing about whether that signature was checked or found good; that verdict
+// comes from the server's OnSignature callback or TrustStore.
+func (e Email) Signed() bool {
+	return e.PublicKey != "" && e.Signature != ""
+}
+
+// SignatureStatus is a short label for logs and user interfaces.
+func (e Email) SignatureStatus() string {
+	if e.Signed() {
+		return "signed"
+	}
+	return "unsigned"
+}
+
+// Hashcash timestamp helpers. Token minting and verification live in
+// hashcash.go; these two are shared by both token versions.
 func FormatHashcashDate(t time.Time) string {
 	t = t.UTC()
 	return fmt.Sprintf("%02d%02d%02d%02d%02d%02d",
@@ -116,73 +167,4 @@ func ParseHashcashDate(s string) (time.Time, error) {
 	min, _ := strconv.Atoi(s[8:10])
 	sec, _ := strconv.Atoi(s[10:12])
 	return time.Date(2000+y, time.Month(m), d, h, min, sec, 0, time.UTC), nil
-}
-
-func HasLeadingZeroBits(sum [20]byte, bits int) bool {
-	if bits <= 0 {
-		return true
-	}
-	if bits > 160 {
-		return false
-	}
-	bi := new(big.Int).SetBytes(sum[:])
-	shift := uint(160 - bits)
-	return bi.Rsh(bi, shift).Sign() == 0
-}
-
-func GenerateHashcash(resource string, bits int) (string, error) {
-	date := FormatHashcashDate(time.Now().UTC())
-	randBytes := make([]byte, 12)
-	if _, err := rand.Read(randBytes); err != nil {
-		return "", err
-	}
-	randStr := hex.EncodeToString(randBytes)
-
-	var counter uint32
-	buf := make([]byte, 4)
-	for {
-		binary.BigEndian.PutUint32(buf, counter)
-		counterB64 := base64.RawStdEncoding.EncodeToString(buf)
-		header := fmt.Sprintf("1:%d:%s:%s::%s:%s", bits, date, resource, randStr, counterB64)
-		h := sha1.Sum([]byte(header))
-		if HasLeadingZeroBits(h, bits) {
-			return header, nil
-		}
-		counter++
-	}
-}
-
-func VerifyHashcash(token, resource string, minBits int) error {
-	parts := strings.Split(token, ":")
-	if len(parts) < 7 || parts[0] != "1" {
-		return fmt.Errorf("malformed hashcash token: len=%d token=%q", len(parts), token)
-	}
-	bits, err := strconv.Atoi(parts[1])
-	if err != nil || bits < minBits {
-		return fmt.Errorf("insufficient bits: got %d, want >= %d", bits, minBits)
-	}
-	// Resource is at parts[3]
-	// Note: resource can contain colon if port is included, so parts after 3 could be shifted if split by colon!
-	// Format is: 1:bits:date:resource:ext:rand:counter
-	// But if resource is alice#example.com:1234, strings.Split(token, ":") will split on the port colon too!
-	expectedPrefix := fmt.Sprintf("1:%s:%s:%s:", parts[1], parts[2], resource)
-	if !strings.HasPrefix(token, expectedPrefix) {
-		return fmt.Errorf("hashcash resource mismatch or format mismatch: prefix %q not in %q", expectedPrefix, token)
-	}
-	tokenTime, err := ParseHashcashDate(parts[2])
-	if err != nil {
-		return errors.New("invalid date in hashcash")
-	}
-	now := time.Now().UTC()
-	if tokenTime.After(now.Add(2 * time.Minute)) {
-		return errors.New("hashcash date in future")
-	}
-	if now.Sub(tokenTime) > 24*time.Hour {
-		return errors.New("hashcash expired")
-	}
-	sum := sha1.Sum([]byte(token))
-	if !HasLeadingZeroBits(sum, bits) {
-		return errors.New("invalid hashcash proof of work")
-	}
-	return nil
 }

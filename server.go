@@ -3,6 +3,7 @@ package twoblade
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -16,16 +17,42 @@ type UserChecker func(username, domain string) bool
 // EmailHandler processes incoming valid email
 type EmailHandler func(email Email) error
 
-// Server implements SHARP TCP protocol
+// Server implements SHARP TCP protocol.
+//
+// Everything below OnEmail is optional 1.4 behaviour. Leaving all of it unset
+// gives a server that behaves exactly like a 1.3 one while still accepting 1.4
+// peers, which is the point: upgrading the library must not force a policy
+// change on anyone.
 type Server struct {
-	Domain       string
-	Port         int
-	MinBits      int
-	UserExists   UserChecker
-	OnEmail      EmailHandler
+	Domain     string
+	Port       int
+	MinBits    int
+	UserExists UserChecker
+	OnEmail    EmailHandler
+
+	// TrustStore verifies sender signatures and pins keys on first use. When
+	// nil, signatures are still carried to OnEmail but not checked.
+	TrustStore *TrustStore
+	// RequireSignature rejects unsigned mail. Off by default, because turning
+	// it on would drop every 1.3 peer's mail.
+	RequireSignature bool
+	// AcceptLegacyHashcash allows version 1 (SHA-1) tokens. Defaults to true
+	// when unset via AllowHashcashV1 for clarity; a server that refuses them
+	// would break every 1.3 sender, so the zero value must be permissive.
+	RejectLegacyHashcash bool
+	// Capabilities advertises optional extensions. Nil advertises
+	// AllCapabilities, which describes what this build can actually do.
+	Capabilities []string
+	// OnSignature reports the verification outcome for each signed message.
+	OnSignature func(email Email, result SignatureResult, detail error)
+	// DedupeMessageID discards a repeat delivery carrying a MessageID already
+	// seen from the same sender, so a sender's retry does not file twice.
+	DedupeMessageID bool
+
 	listener     net.Listener
 	mu           sync.Mutex
 	usedTokens   map[string]time.Time
+	seenIDs      map[string]time.Time
 	shutdownOnce sync.Once
 	quit         chan struct{}
 }
@@ -41,8 +68,17 @@ func NewServer(domain string, port int, userExists UserChecker, onEmail EmailHan
 		UserExists: userExists,
 		OnEmail:    onEmail,
 		usedTokens: make(map[string]time.Time),
+		seenIDs:    make(map[string]time.Time),
 		quit:       make(chan struct{}),
 	}
+}
+
+// offeredCapabilities is what this server tells peers it understands.
+func (s *Server) offeredCapabilities() []string {
+	if s.Capabilities != nil {
+		return s.Capabilities
+	}
+	return AllCapabilities
 }
 
 func (s *Server) Start() error {
@@ -81,6 +117,13 @@ func (s *Server) cleanupLoop() {
 					delete(s.usedTokens, token)
 				}
 			}
+			// Message ids are remembered for the same window as hashcash
+			// tokens: long enough to swallow a retry, short enough to forget.
+			for id, exp := range s.seenIDs {
+				if now.After(exp) {
+					delete(s.seenIDs, id)
+				}
+			}
 			s.mu.Unlock()
 		}
 	}
@@ -102,11 +145,16 @@ func (s *Server) acceptLoop() {
 }
 
 type sessionState struct {
-	step     string
-	from     string
-	to       string
-	hashcash string
-	email    Email
+	step      string
+	from      string
+	to        string
+	hashcash  string
+	version   string
+	peerCaps  []string
+	messageID string
+	publicKey string
+	signature string
+	email     Email
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -142,10 +190,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 				sendError(conn, "Expected HELLO", 400)
 				return
 			}
-			if cmd.Protocol != ProtocolVersion {
+			// Version negotiation, not a version gate. A 1.3 peer sends no
+			// supported list, so negotiateVersion reads its single Protocol
+			// value; a 1.4 peer may list several and we pick the newest we share.
+			agreed, ok := negotiateVersion(cmd.Protocol, cmd.Supported, SupportedVersions)
+			if !ok {
 				sendError(conn, fmt.Sprintf("Unsupported protocol version: %s", cmd.Protocol), 400)
 				return
 			}
+			state.version = agreed
+			state.peerCaps = commonCapabilities(cmd.Capabilities, s.offeredCapabilities())
 			from, err := ParseAddress(cmd.ServerID)
 			if err != nil {
 				sendError(conn, "Invalid server_id format", 400)
@@ -154,7 +208,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 			// ponytail: remote DNS SRV IP verification skipped; add when deploying federated internet nodes
 			state.from = from.String()
 			state.step = "MAIL_TO"
-			_ = sendJSON(conn, Command{Type: "OK", Protocol: ProtocolVersion})
+			// Echo the agreed version and our capabilities so the sender knows
+			// exactly which extensions it may use for this session.
+			_ = sendJSON(conn, Command{
+				Type:         "OK",
+				Protocol:     agreed,
+				Supported:    SupportedVersions,
+				Capabilities: s.offeredCapabilities(),
+			})
 
 		case "MAIL_TO":
 			if cmd.Type != "MAIL_TO" {
@@ -195,6 +256,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 			state.to = cmd.Address
 			state.hashcash = cmd.Hashcash
+			state.messageID = cmd.MessageID
+			state.publicKey = cmd.PublicKey
+			state.signature = cmd.Signature
 			state.step = "DATA"
 			_ = sendJSON(conn, Command{Type: "OK"})
 
@@ -213,17 +277,25 @@ func (s *Server) handleConnection(conn net.Conn) {
 					ct = "text/plain"
 				}
 				state.email = Email{
-					From:        state.from,
-					To:          state.to,
-					Subject:     cmd.Subject,
-					Body:        cmd.Body,
-					ContentType: ct,
-					HTMLBody:    cmd.HTMLBody,
-					Attachments: cmd.Attachments,
-					Hashcash:    state.hashcash,
+					From:            state.from,
+					To:              state.to,
+					Subject:         cmd.Subject,
+					Body:            cmd.Body,
+					ContentType:     ct,
+					HTMLBody:        cmd.HTMLBody,
+					Attachments:     cmd.Attachments,
+					Hashcash:        state.hashcash,
+					MessageID:       state.messageID,
+					PublicKey:       state.publicKey,
+					Signature:       state.signature,
+					ReceivedVersion: state.version,
 				}
 				_ = sendJSON(conn, Command{Type: "OK", Message: "Email content received"})
 			} else if cmd.Type == "END_DATA" {
+				if err := s.verifyInbound(state); err != nil {
+					sendError(conn, err.Error(), 550)
+					return
+				}
 				if s.OnEmail != nil {
 					if err := s.OnEmail(state.email); err != nil {
 						sendError(conn, "Email processing failed", 500)
@@ -240,6 +312,61 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
+// verifyInbound applies the optional 1.4 receiver policies to a session that has
+// finished sending content: duplicate suppression, signature verification and,
+// only if explicitly demanded, rejection of unsigned mail.
+//
+// Returning an error aborts the session with a permanent failure so the sender
+// learns its mail was not accepted, rather than having it vanish.
+func (s *Server) verifyInbound(state *sessionState) error {
+	if s.DedupeMessageID && state.messageID != "" {
+		key := strings.ToLower(state.from) + "\x00" + state.messageID
+		s.mu.Lock()
+		_, seen := s.seenIDs[key]
+		if !seen {
+			s.seenIDs[key] = time.Now().Add(24 * time.Hour)
+		}
+		s.mu.Unlock()
+		if seen {
+			return fmt.Errorf("duplicate message id %s from %s", state.messageID, state.from)
+		}
+	}
+
+	signed := state.publicKey != "" && state.signature != ""
+	if !signed {
+		if s.RequireSignature {
+			return errors.New("this server requires signed mail (SHARP/1.4 signature capability)")
+		}
+		if s.OnSignature != nil {
+			s.OnSignature(state.email, SignatureNone, nil)
+		}
+		return nil
+	}
+
+	// A signed message is always checked, even when TrustStore is nil, because a
+	// signature that does not cover the content is worse than no signature: it
+	// looks like a guarantee and is not one.
+	result := SignatureValid
+	var detail error
+	if s.TrustStore != nil {
+		result, detail = s.TrustStore.VerifyPinned(state.email, state.messageID, state.publicKey, state.signature)
+	} else if pub, err := DecodePublicKey(state.publicKey); err != nil {
+		result, detail = SignatureInvalid, err
+	} else if err := VerifySignature(pub, state.email, state.messageID, state.signature); err != nil {
+		result, detail = SignatureInvalid, err
+	}
+	if s.OnSignature != nil {
+		s.OnSignature(state.email, result, detail)
+	}
+	if result == SignatureInvalid {
+		return fmt.Errorf("invalid signature: %v", detail)
+	}
+	if result == SignatureUntrustedKey {
+		return fmt.Errorf("untrusted signing key: %v", detail)
+	}
+	return nil
+}
+
 func sendJSON(conn net.Conn, cmd Command) error {
 	data, err := json.Marshal(cmd)
 	if err != nil {
@@ -251,88 +378,4 @@ func sendJSON(conn net.Conn, cmd Command) error {
 
 func sendError(conn net.Conn, msg string, code int) {
 	_ = sendJSON(conn, Command{Type: "ERROR", Message: msg, Code: code})
-}
-
-// Client implements SHARP TCP sender
-type Client struct {
-	Timeout time.Duration
-}
-
-func NewClient() *Client {
-	return &Client{Timeout: 10 * time.Second}
-}
-
-func (c *Client) Send(hostPort string, email Email) error {
-	conn, err := net.DialTimeout("tcp", hostPort, c.Timeout)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(c.Timeout))
-
-	reader := bufio.NewReader(conn)
-
-	// Step 1: HELLO
-	if err := sendJSON(conn, Command{Type: "HELLO", ServerID: email.From, Protocol: ProtocolVersion}); err != nil {
-		return err
-	}
-	if err := expectOK(reader); err != nil {
-		return fmt.Errorf("HELLO failed: %w", err)
-	}
-
-	// Step 2: MAIL_TO
-	if err := sendJSON(conn, Command{Type: "MAIL_TO", Address: email.To, Hashcash: email.Hashcash}); err != nil {
-		return err
-	}
-	if err := expectOK(reader); err != nil {
-		return fmt.Errorf("MAIL_TO failed: %w", err)
-	}
-
-	// Step 3: DATA
-	if err := sendJSON(conn, Command{Type: "DATA"}); err != nil {
-		return err
-	}
-	if err := expectOK(reader); err != nil {
-		return fmt.Errorf("DATA failed: %w", err)
-	}
-
-	// Step 4: EMAIL_CONTENT
-	if err := sendJSON(conn, Command{
-		Type:        "EMAIL_CONTENT",
-		Subject:     email.Subject,
-		Body:        email.Body,
-		ContentType: email.ContentType,
-		HTMLBody:    email.HTMLBody,
-		Attachments: email.Attachments,
-	}); err != nil {
-		return err
-	}
-	if err := expectOK(reader); err != nil {
-		return fmt.Errorf("EMAIL_CONTENT failed: %w", err)
-	}
-
-	// Step 5: END_DATA
-	if err := sendJSON(conn, Command{Type: "END_DATA"}); err != nil {
-		return err
-	}
-	if err := expectOK(reader); err != nil {
-		return fmt.Errorf("END_DATA failed: %w", err)
-	}
-
-	return nil
-}
-
-func expectOK(r *bufio.Reader) error {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return err
-	}
-	var resp Command
-	if err := json.Unmarshal([]byte(line), &resp); err != nil {
-		return err
-	}
-	if resp.Type != "OK" {
-		return fmt.Errorf("[%d] %s", resp.Code, resp.Message)
-	}
-	return nil
 }
