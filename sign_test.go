@@ -2,7 +2,9 @@ package twoblade_test
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -402,5 +404,70 @@ func TestDedupeMessageIDSuppressesRetry(t *testing.T) {
 	case <-received:
 		t.Fatal("duplicate mail was filed twice")
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestSigningKeyPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys", "identity.json")
+	key, err := twoblade.LoadOrCreateSigningKey("bob#sender.com", path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	mail := testEmail()
+
+	// A reloaded key must produce a signature the public key verifies, or a
+	// restart would silently start sending unverifiable mail.
+	reloaded, err := twoblade.LoadOrCreateSigningKey("bob#sender.com", path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if reloaded.PublicKeyBase64() != key.PublicKeyBase64() {
+		t.Fatal("reload produced a different key")
+	}
+	sig, err := reloaded.Sign(mail, "id")
+	if err != nil {
+		t.Fatalf("sign after reload: %v", err)
+	}
+	if err := twoblade.VerifySignature(key.PublicKey, mail, "id", sig); err != nil {
+		t.Fatalf("signature from a reloaded key does not verify: %v", err)
+	}
+}
+
+func TestSigningKeyFilePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "id.json")
+	key, _ := twoblade.GenerateSigningKey("bob#sender.com")
+	if err := key.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("private key file mode = %o, want 600", perm)
+	}
+}
+
+func TestLoadSigningKeyRejectsMismatchedPair(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "id.json")
+	a, _ := twoblade.GenerateSigningKey("bob#sender.com")
+	b, _ := twoblade.GenerateSigningKey("bob#sender.com")
+	if err := a.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	// Keep a's private key but claim b's public key.
+	tampered, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	fixed := strings.Replace(string(tampered), a.PublicKeyBase64(), b.PublicKeyBase64(), 1)
+	if fixed == string(tampered) {
+		t.Fatal("test setup: public key not present in file")
+	}
+	if err := os.WriteFile(path, []byte(fixed), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := twoblade.LoadSigningKey(path); err == nil {
+		t.Fatal("mismatched key pair was loaded without complaint")
 	}
 }

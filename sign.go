@@ -86,6 +86,90 @@ func (k *SigningKey) PublicKeyBase64() string {
 	return base64.StdEncoding.EncodeToString(k.PublicKey)
 }
 
+// PrivateKeyBase64 exposes the seed for persistence. Treat the result as a
+// password: anyone holding it can sign as this address.
+func (k *SigningKey) PrivateKeyBase64() string {
+	return base64.StdEncoding.EncodeToString(k.PrivateKey)
+}
+
+// SigningKeyFile is the on-disk form of a signing identity.
+type SigningKeyFile struct {
+	Address    string    `json:"address"`
+	PrivateKey string    `json:"private_key"`
+	PublicKey  string    `json:"public_key"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// Save writes the key to path with owner-only permissions. The file holds a
+// private key, so it is created 0600 and rewritten via a temporary file.
+func (k *SigningKey) Save(path string) error {
+	data, err := json.MarshalIndent(SigningKeyFile{
+		Address:    k.Address,
+		PrivateKey: k.PrivateKeyBase64(),
+		PublicKey:  k.PublicKeyBase64(),
+		CreatedAt:  k.CreatedAt,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(path, data); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+// LoadSigningKey reads a key written by Save, and checks that the stored public
+// key really is the one the private key produces. A mismatched pair would sign
+// mail that nobody can verify, so it is an error rather than a silent repair.
+func LoadSigningKey(path string) (*SigningKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var stored SigningKeyFile
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return nil, fmt.Errorf("read signing key %s: %w", path, err)
+	}
+	priv, err := base64.StdEncoding.DecodeString(stored.PrivateKey)
+	if err != nil || len(priv) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("signing key %s does not hold a valid Ed25519 private key", path)
+	}
+	key := &SigningKey{
+		Address:    strings.ToLower(strings.TrimSpace(stored.Address)),
+		PrivateKey: ed25519.PrivateKey(priv),
+		PublicKey:  ed25519.PrivateKey(priv).Public().(ed25519.PublicKey),
+		CreatedAt:  stored.CreatedAt,
+	}
+	if stored.PublicKey != "" && stored.PublicKey != key.PublicKeyBase64() {
+		return nil, fmt.Errorf("signing key %s: stored public key does not match the private key", path)
+	}
+	return key, nil
+}
+
+// LoadOrCreateSigningKey returns the key at path, generating and saving one on
+// first use. The typical caller is a server bootstrapping an identity per
+// account or per domain with no first-run ceremony.
+func LoadOrCreateSigningKey(address, path string) (*SigningKey, error) {
+	key, err := LoadSigningKey(path)
+	if err == nil {
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	key, err = GenerateSigningKey(address)
+	if err != nil {
+		return nil, err
+	}
+	if err := key.Save(path); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
 // signableBytes is the canonical byte string a signature covers.
 //
 // Every field that a receiver would act on is included, in a fixed order, with

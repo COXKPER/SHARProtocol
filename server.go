@@ -235,24 +235,26 @@ func (s *Server) handleConnection(conn net.Conn) {
 				sendError(conn, "Recipient user not found", 550)
 				return
 			}
-			if cmd.Hashcash == "" {
+			if s.MinBits > 0 && cmd.Hashcash == "" {
 				sendError(conn, "Missing hashcash proof of work", 429)
 				return
 			}
 
-			s.mu.Lock()
-			if _, exists := s.usedTokens[cmd.Hashcash]; exists {
+			if s.MinBits > 0 || cmd.Hashcash != "" {
+				s.mu.Lock()
+				if _, exists := s.usedTokens[cmd.Hashcash]; exists {
+					s.mu.Unlock()
+					sendError(conn, "Hashcash token already used", 429)
+					return
+				}
+				if err := VerifyHashcash(cmd.Hashcash, cmd.Address, s.MinBits); err != nil {
+					s.mu.Unlock()
+					sendError(conn, fmt.Sprintf("Insufficient proof of work: %s", err), 429)
+					return
+				}
+				s.usedTokens[cmd.Hashcash] = time.Now().Add(24 * time.Hour)
 				s.mu.Unlock()
-				sendError(conn, "Hashcash token already used", 429)
-				return
 			}
-			if err := VerifyHashcash(cmd.Hashcash, cmd.Address, s.MinBits); err != nil {
-				s.mu.Unlock()
-				sendError(conn, fmt.Sprintf("Insufficient proof of work: %s", err), 429)
-				return
-			}
-			s.usedTokens[cmd.Hashcash] = time.Now().Add(24 * time.Hour)
-			s.mu.Unlock()
 
 			state.to = cmd.Address
 			state.hashcash = cmd.Hashcash

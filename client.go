@@ -93,7 +93,13 @@ func (c *Client) Send(hostPort string, email Email) error {
 }
 
 func isVersionRejection(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "Unsupported protocol version")
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unsupported protocol version") ||
+		strings.Contains(msg, "protocol version") ||
+		strings.Contains(msg, "version not supported")
 }
 
 // sendVersion performs one full session at a fixed protocol version.
